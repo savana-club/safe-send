@@ -4,26 +4,24 @@
 
 A normal transfer to a mistyped address is lost forever. With Safe Send the funds are locked in an on-chain escrow until the recipient verifies the transfer from the wallet it was sent to. If nobody verifies it (wrong address, lost access, changed your mind), the sender cancels and gets everything back.
 
-- **Network:** Solana **Devnet**
-- **Program:** [`EGLwJZkWybKNMeQQcmJ6HZYnCfTqWn2b7RQVRsPsQ1Zg`](https://explorer.solana.com/address/EGLwJZkWybKNMeQQcmJ6HZYnCfTqWn2b7RQVRsPsQ1Zg?cluster=devnet)
+- **Live app (Mainnet):** https://www.safe-send.app
+- **Test app (Devnet):** https://devnet.safe-send.app — set Phantom to Devnet: Settings → Developer settings → Testnet mode → Solana Devnet
+- **Program (same address on both):** [`EGLwJZkWybKNMeQQcmJ6HZYnCfTqWn2b7RQVRsPsQ1Zg`](https://explorer.solana.com/address/EGLwJZkWybKNMeQQcmJ6HZYnCfTqWn2b7RQVRsPsQ1Zg) — Mainnet build [verified](https://verify.osec.io/status/EGLwJZkWybKNMeQQcmJ6HZYnCfTqWn2b7RQVRsPsQ1Zg) against this repository
 - **Assets:** SOL and any token of the SPL Token program or Token-2022 (except tokens with a transfer hook)
 
 ## How it works
 
-1. **Send.** The sender enters the recipient's address and an amount in the web app and signs with Phantom. The funds move into an escrow account (a PDA of the program) tied to that recipient.
-2. **Verify.** The recipient opens Safe Send with their Phantom wallet: the transfer is listed under *To verify*. Clicking **Verify & receive** signs a `claim` transaction; the program checks the signer is exactly the recipient and releases the funds.
-3. **Or cancel.** Until it is verified, the sender sees the transfer under *Sent, pending* and can **Cancel & refund** at any time.
+1. **Send.** The sender enters the recipient's address and an amount and signs with Phantom. Before signing, the app shows what the send costs (amount, refundable deposit, network fee). The funds move into an escrow account (a PDA of the program) tied to that recipient, and the app gives a link to share with them.
+2. **Claim.** The recipient opens Safe Send with the wallet it was sent to: the transfer is listed under **Receive**. **Claim** signs a transaction; the program checks the signer is exactly the recipient and releases the funds.
+3. **Or cancel.** Until it is claimed, the sender sees it under **Pending** and can **Cancel** at any time to get everything back.
 
-The rent of the escrow accounts always returns to the sender, on verify or cancel.
+The rent of the escrow accounts always returns to the sender, on claim or cancel.
 
 ### The recipient has no SOL for the fee
 
-Verifying is a transaction, so the recipient pays a network fee (5,000 lamports), and a Solana account must also keep a minimum balance (rent-exempt minimum, ~0.00089 SOL). Before sending, the app checks the recipient's SOL balance:
+Claiming is a transaction, so the recipient pays a network fee, and a Solana account must also keep a minimum balance (rent-exempt minimum, ~0.00089 SOL). Before sending, the app checks the recipient's SOL balance; if it is too low, the sender's transaction also sends the difference (~0.00099 SOL for an empty wallet), in the same transaction as the transfer. The app says so before you sign. This small top-up is a normal transfer, so it is not refundable if the address was wrong. The claim's priority fee is kept within what the recipient can pay, so a recipient funded only with the top-up can always claim.
 
-- **enough SOL** (≥ rent-exempt minimum + 20,000 lamports of fee margin): nothing extra;
-- **not enough**: the sender's transaction also sends the difference to the recipient (~0.00091 SOL for an empty wallet), in the same transaction as the transfer. The app says so before you sign. This small top-up is a normal transfer, so it is not refundable if the address was wrong.
-
-For token transfers the recipient's token account is created by the sender at send time, so verifying never costs the recipient more than the fee.
+For token transfers the recipient's token account is created by the sender at send time, so claiming never costs the recipient more than the fee.
 
 ## Program
 
@@ -47,7 +45,7 @@ Checks: only the recipient can claim (`NotRecipient`), only the sender can cance
 ```bash
 cd app
 npm install
-npm run dev          # http://localhost:5173 (uses Devnet; VITE_RPC_URL to change the RPC)
+npm run dev          # http://localhost:5173 (Devnet by default; VITE_CLUSTER / VITE_RPC_URL to change it)
 ```
 
 Network: `VITE_CLUSTER=mainnet-beta` builds the Mainnet app (default `devnet`). On Mainnet the browser calls this site's `/api/rpc` Vercel function (`app/api/rpc.ts`), which forwards only the app's RPC methods (getProgramAccounts only on this program, only from the site's origins) to `HELIUS_MAINNET_RPC_URL`, a server-only secret. Locally: `HELIUS_MAINNET_RPC_URL=<rpc> node scripts/dev-rpc-proxy.ts` and `DEV_API_PROXY=http://127.0.0.1:8790 VITE_CLUSTER=mainnet-beta npx vite`. Transactions are confirmed by polling their status (no websocket needed).
@@ -59,7 +57,7 @@ On Vercel the app uses `VITE_HELIUS_DEVNET_RPC_URL` (Helius Devnet RPC, key rest
 npm run build        # static files in app/dist, deployable on Vercel, Netlify or GitHub Pages
 ```
 
-Phantom must be set to Devnet: Settings → Developer settings → Testnet mode → Solana Devnet.
+For the Devnet app, Phantom must be set to Devnet: Settings → Developer settings → Testnet mode → Solana Devnet.
 
 ## Build, test, deploy
 
@@ -75,7 +73,7 @@ cd app && npm test
 cd app && VITE_RPC_URL=http://127.0.0.1:8899 npx vite
 #   open http://localhost:5173/test/ui/harness.html, then in the browser console:
 #   await harness.setup(2); location.reload();   and after the reload:   await runSuite()
-# deploy to Devnet (needs ~2x the program size in rent, see `solana rent`)
+# deploy (needs ~2x the program size in rent, see `solana rent`; Mainnet steps in DEPLOY.md)
 solana program deploy target/deploy/safe_send.so --program-id target/deploy/safe_send-keypair.json --url devnet
 # then, once per network, create the fee Config (no fees) with the upgrade authority
 cd app && node scripts/config.ts init <authority-keypair.json> --treasury <treasury-address>
