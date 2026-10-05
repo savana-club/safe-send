@@ -1,11 +1,9 @@
 # Mainnet launch checklist
 
-**Status (2026-10-05):** steps 1–5 done. The program is live on Mainnet, built from this repository and verified
+**Status (2026-10-05):** done. The program is live on Mainnet, built from this repository and verified
 ([OtterSec](https://verify.osec.io/status/EGLwJZkWybKNMeQQcmJ6HZYnCfTqWn2b7RQVRsPsQ1Zg), hash `67af2ad3…6767`);
-the fee Config exists with no fees. Remaining: step 6 (switch the site) and step 7.
-
-Everything here runs from the `mainnet` branch. The Devnet version stays on `main`/`devnet` (tag
-`hackathon-devnet-v1`) and live at www.safe-send.app until step 6.
+the fee Config exists with no fees; www.safe-send.app runs on Mainnet (branch `main`) and devnet.safe-send.app on
+Devnet (branch `devnet`). Step 7 lists what comes after launch.
 
 Keys and addresses:
 
