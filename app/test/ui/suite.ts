@@ -9,6 +9,15 @@ const $$ = (s: string) => [...document.querySelectorAll<HTMLElement>(`#app ${s}`
 const text = (s = '') => ((s ? $(s) : document.getElementById('app'))?.innerText ?? '').replace(/\s+/g, ' ');
 const tab = () => $('.seg.active')?.dataset.tab;
 const rpcRequests = () => performance.getEntriesByType('resource').filter((e) => e.name.includes(':8899')).length;
+// The SOL total and the network fee in the cost note ("You pay about X SOL. … about Y SOL is the network fee").
+const shownCost = (pattern: RegExp) => {
+  const note = text('#cost-note');
+  const lamports = (re: RegExp) => Math.round(Number(re.exec(note)![1]) * 1e9);
+  return { total: lamports(pattern), network: lamports(/about ([\d.]+) SOL is the network fee/) };
+};
+// Only the network fee is an estimate (compute units are measured when sending).
+const costMatches = (charged: number, shown: { total: number; network: number }) =>
+  Math.abs(charged - shown.total) <= Math.max(20_000, shown.network / 2);
 const click = (s: string) => { const el = $(s); if (!el) throw new Error(`missing ${s}`); el.click(); };
 const type = (s: string, v: string) => { const el = $(s) as HTMLInputElement; el.value = v; el.dispatchEvent(new Event('input', { bubbles: true })); };
 const pick = (s: string, v: string) => { const el = $(s) as HTMLSelectElement; el.value = v; el.dispatchEvent(new Event('change', { bubbles: true })); };
@@ -72,6 +81,12 @@ async function until<T>(fn: () => T, what: string, ms = 20_000): Promise<T> {
     await until(() => $('#send-result .error'), 'rejection');
     check('rejection shown, send re-enabled', text('#send-result').includes('rejected') && !($('#send') as HTMLButtonElement).disabled);
 
+    // The cost shown before signing matches what leaves the wallet (plus the network fee)
+    type('#amount', '0.5');
+    await until(() => text('#cost-note').includes('You pay'), 'cost shown');
+    const shown = shownCost(/You pay about ([\d.]+) SOL/);
+    const balanceBefore = await h.balance(0);
+
     // Send SOL (double click sends once)
     const signs = h.controls.signs;
     click('#send'); click('#send');
@@ -79,6 +94,8 @@ async function until<T>(fn: () => T, what: string, ms = 20_000): Promise<T> {
     check('send once on double click', h.controls.signs === signs + 1, String(h.controls.signs - signs));
     check('form cleared after send', ($('#amount') as HTMLInputElement).value === '' && ($('#recipient') as HTMLInputElement).value === '');
     await until(() => text('.segments').includes('Pending 1'), 'pending count');
+    const charged = balanceBefore - (await h.balance(0));
+    check('cost shown = amount charged (network fee estimated)', costMatches(charged, shown), `shown ${JSON.stringify(shown)}, charged ${charged}`);
 
     // Fees on: the app shows the fee before sending and the treasury receives it
     const treasury = await h.setFees(30, 0.001); // 0.3% + 0.001 SOL
@@ -129,8 +146,13 @@ async function until<T>(fn: () => T, what: string, ms = 20_000): Promise<T> {
     check('no note for a plain token', text('#token-note') === '', text('#token-note'));
     type('#amount', '7.25'); type('#recipient', B);
     await until(() => !($('#send') as HTMLButtonElement).disabled, 'check B token');
+    await until(() => text('#cost-note').includes('token account for the recipient'), 'token cost shown');
+    const tokenShown = shownCost(/\+ ([\d.]+) SOL/);
+    const solBeforeToken = await h.balance(0);
     click('#send');
     await until(() => $('#send-result .ok'), 'token sent');
+    const tokenCharged = solBeforeToken - (await h.balance(0));
+    check('token send: SOL shown = SOL charged (network fee estimated)', costMatches(tokenCharged, tokenShown), `shown ${JSON.stringify(tokenShown)}, charged ${tokenCharged}`);
 
     pick('#asset', hookMint);
     check('hook token: warned', text('#token-note').includes('transfer hook'), text('#token-note'));
@@ -180,6 +202,38 @@ async function until<T>(fn: () => T, what: string, ms = 20_000): Promise<T> {
     click('#send');
     await until(() => $('#send-result .ok, #send-result .error'), 'send back');
     check('send back from the second wallet', !!$('#send-result .ok'), text('#send-result'));
+
+    // Real Phantom (side panel) may not announce a switch to an account that never connected: the add banner's
+    // Connect button connects the account selected in Phantom
+    const cIndex = await h.addEmptyAccount();
+    const C = h.address(cIndex);
+    h.controls.silentUntrusted = true;
+    click('[data-menu]'); click('[data-add]'); await wait(100);
+    click('.switch-hint [data-connect]'); // B still selected in Phantom
+    await until(() => text('.switch-hint').includes('still has'), 'still selected hint');
+    check('add: says when Phantom still has the active wallet selected', text('.switch-hint').includes(B.slice(0, 4)), text('.switch-hint'));
+    h.select(cIndex); await wait(300);
+    check('add: no event from Phantom, still on B', text('.top').includes(B.slice(0, 4)), text('.top'));
+    click('.switch-hint [data-connect]');
+    await until(() => text('.top').includes(C.slice(0, 4)), 'C connected with the button');
+    check('add: Connect connects the account selected in Phantom', true);
+    h.controls.silentUntrusted = false;
+    // No event at all when switching to another connected wallet (Phantom side panel): the app notices by itself,
+    // within about a second, without a click or focus
+    h.controls.silentAll = true;
+    const switchedAt = Date.now();
+    h.select(1);
+    await until(() => text('.top').includes(B.slice(0, 4)), 'B followed without an event', 3_000);
+    check('switch noticed without an event or a click', Date.now() - switchedAt < 1_000, `${Date.now() - switchedAt} ms`);
+    h.select(cIndex);
+    await until(() => text('.top').includes(C.slice(0, 4)), 'C followed without an event', 3_000);
+    h.select(1);
+    await until(() => text('.top').includes(B.slice(0, 4)), 'B again', 3_000);
+    h.controls.silentAll = false;
+    // Remove C again (the checks below expect A and B only)
+    h.select(cIndex); await until(() => text('.top').includes(C.slice(0, 4)), 'C active');
+    click('[data-menu]'); click('[data-disconnect]'); await wait(200);
+    h.select(1); await until(() => text('.top').includes(B.slice(0, 4)), 'back to B again');
 
     // Disconnect B only: A stays connected, B needs a new signature
     click('[data-menu]'); click('[data-disconnect]'); await wait(200);

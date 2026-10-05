@@ -1,18 +1,16 @@
 import './polyfills.ts';
 import './style.css';
 import { Connection, PublicKey, SendTransactionError, Transaction } from '@solana/web3.js';
-import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from '@solana/spl-token';
+import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from '@solana/spl-token';
 import {
   cancelSolIx, cancelTokenIx, checkRecipientFees, claimSolIx, claimTokenIx, escrowAddress, incomingTransfers,
   fetchConfig, mintInfos, newTransferId, outgoingTransfers, percentFee, sendSolIx, sendTokenIxs, topUpIx, transferFeeOf,
   type FeeCheck, type FeeConfig, type MintInfo, type PendingTransfer,
 } from './lib/safeSend.ts';
-import { MAX_PRIORITY_LAMPORTS, claimPriorityCap, computeBudget } from './lib/fees.ts';
+import { BASE_FEE_LAMPORTS, MAX_PRIORITY_LAMPORTS, cappedPrice, claimPriorityCap, computeBudget, recentPrice } from './lib/fees.ts';
 import { approveAccount, connectWithSignature, connectedWallets, disconnectWallet, isDisconnected, phantom, rememberWallet, selectedAccount, signAndSend } from './wallet.ts';
 
-// Helius Devnet RPC from Vercel (public by design: VITE_ variables end up in the page; the key is restricted to
-// our domains in Helius). VITE_RPC_URL overrides it, e.g. a local validator for the UI tests.
-const RPC_URL = import.meta.env.VITE_RPC_URL ?? import.meta.env.VITE_HELIUS_DEVNET_RPC_URL ?? 'https://api.devnet.solana.com';
+import { IS_MAINNET, NETWORK_NAME, RPC_URL, explorer } from './network.ts';
 // Rate limits are retried below with a bounded number of attempts, not by web3.js's own open-ended backoff.
 const connection = new Connection(RPC_URL, { commitment: 'confirmed', disableRetryOnRateLimit: true });
 const app = document.getElementById('app')!;
@@ -42,7 +40,7 @@ const state = {
   // selected account, a website cannot change it).
   pending: null as string | null,
   // Shown above the content: how to add a wallet, or the account selected in Phantom is not connected here.
-  notice: null as null | { kind: 'add' } | { kind: 'not-connected'; account: string | null },
+  notice: null as null | { kind: 'add'; stillSelected?: string } | { kind: 'not-connected'; account: string | null },
   // The send form and its checks live here so re-rendering never loses what the user typed.
   form: emptyForm(),
   fee: null as null | { recipient: string; check: FeeCheck }, // fee check of the recipient in the form
@@ -57,7 +55,6 @@ const closed = new Set<string>();
 
 const escape = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const short = (k: PublicKey | string) => { const s = k.toString(); return `${s.slice(0, 4)}…${s.slice(-4)}`; };
-const explorer = (kind: 'tx' | 'address', id: string) => `https://explorer.solana.com/${kind}/${id}?cluster=devnet`;
 const date = (ms: number) => new Date(ms).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' });
 
 function units(value: bigint, decimals: number): string {
@@ -76,6 +73,8 @@ function parseUnits(text: string, decimals: number): bigint | null {
 }
 
 const sol = (lamports: number | bigint) => units(BigInt(lamports), 9);
+// SOL rounded up to 6 decimals, for estimates shown before signing.
+const solUp = (lamports: number) => sol(Math.ceil(lamports / 1_000) * 1_000);
 
 // Mints (token program, decimals, Token-2022 extensions), loaded with the wallet's data so rendering never
 // waits for the network.
@@ -96,7 +95,7 @@ function describeError(err: unknown): string {
   if (/User rejected|rejected the request/i.test(text)) return 'You rejected the request in Phantom.';
   if (/not been authorized/i.test(text)) return 'Phantom has not connected this account to Safe Send. Approve the connection in Phantom and try again.';
   if (/block height exceeded|expired/i.test(text)) return 'The transaction expired before it was confirmed. Nothing was sent: try again.';
-  if (/failed to fetch|network|429|timed? ?out/i.test(text)) return 'Could not reach Solana Devnet. Check your connection and try again.';
+  if (/failed to fetch|network|429|timed? ?out/i.test(text)) return `Could not reach ${NETWORK_NAME}. Check your connection and try again.`;
   const logs = err instanceof SendTransactionError ? (err.logs ?? []).join('\n') : text;
   const anchor = /Error Message: ([^.\n]+)/.exec(logs);
   if (anchor) return `${anchor[1]}.`;
@@ -114,7 +113,7 @@ function withTimeout<T>(promise: Promise<T>): Promise<T> {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-// The public Devnet RPC rejects bursts of requests: retry a failed call a couple of times before giving up.
+// Public RPCs reject bursts of requests: retry a failed call a couple of times before giving up.
 async function retry<T>(call: () => Promise<T>): Promise<T> {
   for (let attempt = 0; ; attempt++) {
     try {
@@ -256,7 +255,7 @@ function header(): string {
     : ''; // not connected: the welcome screen has the connect button
   return `
     <header class="top">
-      <div class="brand"><span class="logo">${SHIELD}</span>Safe Send<span class="chip">Devnet</span></div>
+      <div class="brand"><span class="logo">${SHIELD}</span>Safe Send${IS_MAINNET ? '' : '<span class="chip">Devnet</span>'}</div>
       ${right}
     </header>`;
 }
@@ -271,9 +270,13 @@ function walletNotice(): string {
     </div>`;
   }
   if (state.notice?.kind === 'add') {
+    // Phantom does not always tell the site about a switch to an account that never connected (e.g. from its
+    // side panel), so the user confirms with Connect once the account is selected.
+    const still = state.notice.stillSelected;
     return `<div class="switch-hint">
       <strong>Add another wallet</strong>
-      Select the other account in Phantom: Safe Send switches to it automatically.
+      ${still ? `Phantom still has ${short(still)} selected: select the other account at the top of Phantom first.` : 'Select the other account in Phantom, then connect it here.'}
+      <button class="pill primary small" data-connect>Connect</button>
     </div>`;
   }
   if (state.notice?.kind === 'not-connected') {
@@ -302,7 +305,7 @@ function welcome(): string {
         ${wallets.map((w) => `<button class="wallet-row" data-use="${w}"><span class="avatar small"></span>${short(w)}</button>`).join('')}
       </div>` : ''}
       <button class="pill primary big" data-connect>${!phantom() ? 'Get Phantom' : wallets.length ? 'Connect another wallet' : 'Connect Phantom'}</button>
-      <p class="hint">Connecting asks for a free signature. Use Devnet: Phantom → Settings → Developer settings → Testnet mode</p>
+      <p class="hint">Connecting asks for a free signature.${IS_MAINNET ? '' : ' Use Devnet: Phantom → Settings → Developer settings → Testnet mode'}</p>
     </section>`;
 }
 
@@ -314,7 +317,7 @@ function tabs(): string {
 
 // A failed refresh: the data on screen may be old.
 const status = () => `<div id="status">${state.loadError
-  ? `<div class="notice error status-error">Could not reach Solana Devnet${state.loaded ? ', balances may be out of date' : ''}. <button class="link-button" data-retry>Retry</button></div>`
+  ? `<div class="notice error status-error">Could not reach ${NETWORK_NAME}${state.loaded ? ', balances may be out of date' : ''}. <button class="link-button" data-retry>Retry</button></div>`
   : ''}</div>`;
 
 // The asset in the form, or SOL if that token is no longer in the wallet.
@@ -336,6 +339,84 @@ function tokenNote(asset: string): string {
   }
   if (info.permanentDelegate) notes.push("This token's issuer can move it from any account, including the escrow.");
   return notes.join(' ');
+}
+
+// --- Cost before signing ---
+
+// Rent deposits by account size, and which token accounts exist (recipient's, treasury's), cached.
+const rentCache = new Map<number, number>();
+const accountExists = new Map<string, boolean>();
+const rentFor = async (bytes: number) => {
+  if (!rentCache.has(bytes)) rentCache.set(bytes, await retry(() => connection.getMinimumBalanceForRentExemption(bytes)));
+  return rentCache.get(bytes)!;
+};
+async function exists(address: PublicKey): Promise<boolean> {
+  const key = address.toBase58();
+  if (!accountExists.has(key)) accountExists.set(key, !!(await retry(() => connection.getAccountInfo(address))));
+  return accountExists.get(key)!;
+}
+
+// Recent priority fees on the accounts a send writes (sender and treasury), refreshed at most every 20 s.
+let feesCache: { key: string; at: number; price: number } | null = null;
+async function priorityPrice(writable: PublicKey[]): Promise<number> {
+  const key = writable.map((k) => k.toBase58()).join();
+  if (!feesCache || feesCache.key !== key || Date.now() - feesCache.at > 20_000) {
+    const fees = await retry(() => connection.getRecentPrioritizationFees({ lockedWritableAccounts: writable }));
+    feesCache = { key, at: Date.now(), price: recentPrice(fees) };
+  }
+  return feesCache.price;
+}
+
+// Compute units a send typically uses (measured on the program, with margin): the exact amount is measured
+// when sending, so the network fee shown before is an estimate.
+const SOL_SEND_UNITS = 20_000;
+const TOKEN_SEND_UNITS = 60_000;
+const ATA_CREATE_UNITS = 25_000;
+
+let costToken = 0;
+
+// What the sender pays for the transfer in the form: the amount and Safe Send's fee, plus the SOL deposits for
+// the accounts the transfer opens (returned on claim or cancel), the token accounts it creates for the recipient
+// or the treasury (not returned), the recipient's claim-fee top-up, and the network fee.
+async function updateCost(): Promise<void> {
+  const out = document.getElementById('cost-note');
+  const token = ++costToken;
+  const show = (html: string) => { if (token === costToken && out) out.innerHTML = html; };
+  const config = state.config;
+  const fee = state.fee;
+  const asset = currentAsset();
+  const holding = asset === 'SOL' ? null : state.tokens.find((t) => t.mint.toBase58() === asset);
+  const mint = holding ? mintCache.get(asset) : null;
+  const amount = parseUnits(state.form.amount, holding ? holding.decimals : 9);
+  if (!config || !fee || fee.recipient !== state.form.recipient.trim() || !amount || amount <= 0n || (holding && !mint)) return show('');
+  try {
+    const recipient = new PublicKey(fee.recipient);
+    const percent = percentFee(config, amount);
+    const ESCROW_BYTES = 194;
+    let deposit = await rentFor(ESCROW_BYTES);
+    let accounts = 0; // token accounts created for others, paid by the sender
+    if (mint) {
+      deposit += await rentFor(mint.vaultSize);
+      const ata = (owner: PublicKey) => getAssociatedTokenAddressSync(mint.mint, owner, true, mint.tokenProgram);
+      if (!(await exists(ata(recipient)))) accounts += await rentFor(mint.ataSize);
+      if (percent > 0n && !(await exists(ata(config.treasury)))) accounts += await rentFor(mint.ataSize);
+    }
+    const flat = Number(config.flatFeeLamports);
+    // Network fee: signature fee + priority fee at the current price, within the same cap as when sending
+    const computeUnits = mint ? TOKEN_SEND_UNITS + ATA_CREATE_UNITS * (percent > 0n ? 2 : 1) : SOL_SEND_UNITS;
+    const price = cappedPrice(await priorityPrice([state.wallet!, config.treasury]), computeUnits, MAX_PRIORITY_LAMPORTS);
+    const networkFee = BASE_FEE_LAMPORTS + Math.ceil((computeUnits * price) / 1_000_000);
+    const solTotal = (mint ? 0 : Number(amount + percent)) + flat + deposit + accounts + fee.check.topUp + networkFee;
+    const unit = holding ? short(holding.mint) : 'SOL';
+    const parts = [`<strong>${mint ? `${units(amount + percent, holding!.decimals)} ${unit} + ` : ''}${solUp(solTotal)} SOL</strong>`];
+    const details = [`${solUp(deposit)} SOL is a deposit you get back on claim or cancel`];
+    if (accounts) details.push(`${solUp(accounts)} SOL opens a token account for ${percent > 0n ? 'the recipient or the fee' : 'the recipient'}`);
+    if (fee.check.topUp) details.push(`${solUp(fee.check.topUp)} SOL covers the recipient's claim fee`);
+    details.push(`about ${solUp(networkFee)} SOL is the network fee`);
+    show(`You pay about ${parts.join('')}. <span class="muted">${details.join('; ')}.</span>`);
+  } catch {
+    show('');
+  }
 }
 
 // Safe Send's fee for sending `state.form.amount` of `asset`, paid on top (empty while there are no fees).
@@ -377,6 +458,7 @@ function sendView(): string {
         <input id="recipient" autocomplete="off" spellcheck="false" placeholder="Recipient wallet address" value="${escape(state.form.recipient)}" />
       </label>
       <p id="recipient-check" class="check ${state.check?.cls ?? ''}">${state.check?.html ?? ''}</p>
+      <p id="cost-note" class="cost-note"></p>
       <button id="send" class="pill primary big" ${canSend() ? '' : 'disabled'}>Safe Send</button>
       <div id="send-result"></div>
       <details class="how">
@@ -436,6 +518,7 @@ function render(): void {
   } else {
     const body = state.tab === 'send' ? sendView() : listView(state.tab);
     app.innerHTML = `<div class="shell">${header()}${walletNotice()}<div class="card">${tabs()}${status()}${body}</div></div>`;
+    if (state.tab === 'send') void updateCost();
     const flash = state.flash?.tab === state.tab && document.getElementById(state.flash.target);
     if (flash) flash.innerHTML = `<div class="notice ${state.flash!.kind}">${state.flash!.html}</div>`;
   }
@@ -455,6 +538,7 @@ function message(target: Flash['target'], html: string, kind: Flash['kind'] = 'i
 function updateSendButton(): void {
   const button = document.getElementById('send') as HTMLButtonElement | null;
   if (button) button.disabled = !canSend();
+  void updateCost(); // the recipient check changed
 }
 
 function showCheck(cls: string, html: string): void {
@@ -491,7 +575,7 @@ async function checkRecipient(): Promise<void> {
       : '✓ The recipient can pay the claim fee.');
   } catch {
     if (token !== checkToken) return;
-    showCheck('error', 'Could not check this address: Solana Devnet did not answer. <button class="link-button" data-recheck>Try again</button>');
+    showCheck('error', `Could not check this address: ${NETWORK_NAME} did not answer. <button class="link-button" data-recheck>Try again</button>`);
   }
 }
 
@@ -543,6 +627,7 @@ async function send(): Promise<void> {
   const link = `${location.origin}${location.pathname}?transfer=${escrowAddress(sender, id).toBase58()}`;
   const own = connectedWallets().includes(recipient.toBase58());
   Object.assign(state, { form: emptyForm(asset), fee: null, check: null });
+  accountExists.clear(); // the send may have created token accounts
   state.flash = { tab: 'send', target: 'send-result', kind: 'ok', html: `
     <strong>Locked and on its way.</strong> It arrives when the recipient claims it.
     ${check.topUp ? `<br/>Included ${sol(check.topUp)} SOL so they can pay the claim fee.` : ''}
@@ -633,12 +718,14 @@ function bind(root: ParentNode): void {
   on('#amount', (el) => {
     state.form.amount = (el as HTMLInputElement).value;
     document.getElementById('fee-note')!.textContent = feeNote(state.form.asset);
+    void updateCost();
   }, 'input');
   on('#asset', (el) => {
     state.form.asset = (el as HTMLSelectElement).value;
     document.getElementById('balance')!.textContent = balanceLabel(state.form.asset);
     document.getElementById('token-note')!.innerHTML = tokenNote(state.form.asset);
     document.getElementById('fee-note')!.textContent = feeNote(state.form.asset);
+    void updateCost();
   }, 'change');
   on('#recipient', (el) => {
     state.form.recipient = (el as HTMLInputElement).value;
@@ -695,7 +782,13 @@ async function connectNew(): Promise<void> {
     const selected = (await selectedAccount())?.toBase58();
     const needsSignature = connectedWallets().length === 0 || (!!selected && isDisconnected(selected));
     const wallet = needsSignature ? await connectWithSignature() : await approveAccount();
-    if (wallet) activate(wallet.toBase58());
+    if (wallet && state.notice?.kind === 'add' && state.wallet?.equals(wallet)) {
+      // Adding a wallet, but Phantom still has the active one selected
+      state.notice = { kind: 'add', stillSelected: wallet.toBase58() };
+      render();
+    } else if (wallet) {
+      activate(wallet.toBase58());
+    }
   } finally {
     connecting = false;
   }
@@ -750,6 +843,35 @@ phantom()?.on('accountChanged', async (key) => {
     approving = false;
   }
 });
+
+// Back on the page (e.g. after using Phantom's side panel or popup): if Phantom now has another connected wallet
+// selected, switch to it. Phantom does not always send accountChanged, so this checks directly.
+let following = false;
+async function followSelected(): Promise<void> {
+  if (!state.wallet || connecting || approving || state.busy || following) return;
+  following = true;
+  try {
+    const selected = (await selectedAccount())?.toBase58();
+    if (selected && selected !== state.wallet?.toBase58() && connectedWallets().includes(selected) && !isDisconnected(selected)) {
+      activate(selected);
+    }
+  } finally {
+    following = false;
+  }
+}
+window.addEventListener('focus', () => void followSelected());
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') void followSelected(); });
+
+// accountChanged is the instant path, but Phantom's side panel does not send it. While the page is visible the
+// app also watches Phantom itself, talking only to the extension (no RPC): every 0.1 s it reads the account
+// Phantom exposes on the page (an in-memory property, negligible cost), and every 1 s, in case that property is
+// not updated, it asks Phantom which account is selected (a message to the extension, so not more often).
+const watching = () => document.visibilityState === 'visible' && !!state.wallet;
+setInterval(() => {
+  const exposed = phantom()?.publicKey?.toString();
+  if (watching() && exposed && exposed !== state.wallet?.toBase58()) void followSelected();
+}, 100);
+setInterval(() => { if (watching()) void followSelected(); }, 1_000);
 
 render();
 // Back on the page: resume with the account selected in Phantom, unless the user disconnected.

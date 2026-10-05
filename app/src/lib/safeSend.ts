@@ -4,7 +4,7 @@ import {
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID, ExtensionType, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID,
   createAssociatedTokenAccountIdempotentInstruction, getAssociatedTokenAddressSync, getExtensionTypes,
-  getTransferFeeConfig, getTransferHook, unpackMint,
+  getAccountLen, getAccountLenForMint, getAccountTypeOfMintType, getTransferFeeConfig, getTransferHook, unpackMint,
 } from '@solana/spl-token';
 import { sha256 } from '@noble/hashes/sha256';
 
@@ -141,6 +141,10 @@ export interface MintInfo {
   transferHook: boolean;
   // The issuer can move tokens out of any account, including the escrow.
   permanentDelegate: boolean;
+  // Sizes (bytes) of a token account for this mint: the vault, and an associated token account (Token-2022 adds
+  // the immutable-owner extension to those). They set the deposits the sender pays.
+  vaultSize: number;
+  ataSize: number;
 }
 
 export async function mintInfos(connection: Connection, mints: PublicKey[]): Promise<Map<string, MintInfo>> {
@@ -168,6 +172,10 @@ export async function mintInfos(connection: Connection, mints: PublicKey[]): Pro
           ? { basisPoints: feeConfig.transferFeeBasisPoints, maximum: feeConfig.maximumFee } : null,
         transferHook: !!hook && (!hook.programId.equals(PublicKey.default) || !hook.authority.equals(PublicKey.default)),
         permanentDelegate: extensions.includes(ExtensionType.PermanentDelegate),
+        vaultSize: getAccountLenForMint(state),
+        ataSize: tokenProgram.equals(TOKEN_2022_PROGRAM_ID)
+          ? getAccountLen([...extensions.map(getAccountTypeOfMintType).filter((e) => e !== ExtensionType.Uninitialized), ExtensionType.ImmutableOwner])
+          : getAccountLenForMint(state),
       });
     });
   }
@@ -273,6 +281,39 @@ async function transfersBy(connection: Connection, offset: number, wallet: Publi
 export const incomingTransfers = (connection: Connection, wallet: PublicKey) => transfersBy(connection, RECIPIENT_OFFSET, wallet);
 // Transfers this wallet sent that are not verified yet (it can still cancel them).
 export const outgoingTransfers = (connection: Connection, wallet: PublicKey) => transfersBy(connection, SENDER_OFFSET, wallet);
+
+// --- Events ---
+
+// The program's events (Anchor `emit!`), read from a transaction's logs ("Program data: <base64>").
+export type SafeSendEvent =
+  | { name: 'TransferSent'; escrow: PublicKey; sender: PublicKey; recipient: PublicKey; mint: PublicKey; amount: bigint; fee: bigint; flatFeeLamports: bigint }
+  | { name: 'TransferClaimed' | 'TransferCancelled'; escrow: PublicKey; sender: PublicKey; recipient: PublicKey; mint: PublicKey; amount: bigint }
+  | { name: 'ConfigUpdated'; admin: PublicKey; treasury: PublicKey; feeBps: number; flatFeeLamports: bigint };
+
+const EVENTS = ['TransferSent', 'TransferClaimed', 'TransferCancelled', 'ConfigUpdated'] as const;
+const EVENT_DISCRIMINATORS = EVENTS.map((name) => ({ name, bytes: discriminator(`event:${name}`) }));
+
+export function parseEvents(logs: string[]): SafeSendEvent[] {
+  const events: SafeSendEvent[] = [];
+  for (const line of logs) {
+    if (!line.startsWith('Program data: ')) continue;
+    const bytes = Buffer.from(line.slice('Program data: '.length), 'base64');
+    const kind = EVENT_DISCRIMINATORS.find((e) => e.bytes.every((b, i) => bytes[i] === b));
+    if (!kind) continue;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const key = (offset: number) => new PublicKey(bytes.subarray(offset, offset + 32));
+    const u64at = (offset: number) => view.getBigUint64(offset, true);
+    if (kind.name === 'ConfigUpdated') {
+      events.push({ name: kind.name, admin: key(8), treasury: key(40), feeBps: view.getUint16(72, true), flatFeeLamports: u64at(74) });
+    } else {
+      const base = { escrow: key(8), sender: key(40), recipient: key(72), mint: key(104), amount: u64at(136) };
+      events.push(kind.name === 'TransferSent'
+        ? { name: kind.name, ...base, fee: u64at(144), flatFeeLamports: u64at(152) }
+        : { name: kind.name, ...base });
+    }
+  }
+  return events;
+}
 
 // --- Recipient fee check ---
 
