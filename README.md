@@ -26,6 +26,10 @@ Safe Send puts an escrow between "send" and "received". The funds move into an a
 
 Assets: SOL, any SPL token and Token-2022 tokens (including transfer-fee mints; tokens with a transfer hook are refused).
 
+### Blink
+
+Safe Send is also a [Blink](https://solana.com/docs/advanced/actions) (Solana Action): a link to `https://www.safe-send.app` shared on X unfolds into a small form (recipient, amount, **Safe Send**) that sends SOL into escrow from Phantom, without leaving the post. `https://www.safe-send.app/?to=<wallet>` is a "send to me" link: the Blink asks only for the amount, and the app opens with the recipient filled in. The action is served by `app/api/actions/send.ts` and mapped from the home page by `app/public/actions.json`; it builds the same transaction as the app (escrow, top-up for the recipient's claim fee, priority fee).
+
 ## How Solana is used
 
 - **Custom on-chain program** (Rust, Anchor 0.30.1) in [`programs/safe_send/src/lib.rs`](programs/safe_send/src/lib.rs). Each transfer is an escrow PDA, and tokens sit in a vault token account owned by the program. Release goes only to the recipient, refund only to the sender.
@@ -72,6 +76,8 @@ safe_send/
     │   ├── lib/fees.ts             compute budget: simulation, priority price, caps
     │   └── style.css
     ├── api/rpc.ts                  Vercel function: RPC proxy for Mainnet (method and origin allowlist)
+    ├── api/actions/send.ts         Vercel function: the Blink (Solana Action) that builds a Safe Send
+    ├── public/                     actions.json (maps the site to the Blink) and the Blink image
     ├── scripts/                    operator tools: fee config, escrow listing, Devnet/Mainnet smoke tests
     └── test/                       end-to-end tests on a local validator, and a UI test harness
 ```
@@ -118,7 +124,7 @@ anchor build
 solana-test-validator --reset \
   --upgradeable-program EGLwJZkWybKNMeQQcmJ6HZYnCfTqWn2b7RQVRsPsQ1Zg target/deploy/safe_send.so 8igxrcwdyKwhBbvxs8WZmXGugvaMgDZ9Fu2w6TSyjnKC
 
-cd app && npm test     # end-to-end: SOL, SPL, Token-2022, fees, config, RPC proxy
+cd app && npm test     # end-to-end: SOL, SPL, Token-2022, fees, config, RPC proxy, Blink
 ```
 
 UI tests drive the real app with a fake Phantom that signs with test keypairs, against the same validator:

@@ -19,7 +19,9 @@ type Tab = 'send' | 'incoming' | 'sent';
 type Flash = { tab: Tab; target: 'send-result' | 'list-result'; html: string; kind: 'ok' | 'error' | 'info' };
 interface TokenHolding { mint: PublicKey; account: PublicKey; amount: bigint; decimals: number }
 
-const emptyForm = (asset = 'SOL') => ({ amount: '', recipient: '', asset });
+// A link like safe-send.app/?to=<address> (the "send to" Blink, a shared QR code) fills in the recipient.
+let sharedRecipient = new URLSearchParams(location.search).get('to') ?? '';
+const emptyForm = (asset = 'SOL') => ({ amount: '', recipient: sharedRecipient, asset });
 
 const state = {
   wallet: null as PublicKey | null,
@@ -626,6 +628,7 @@ async function send(): Promise<void> {
   if (!state.wallet?.equals(sender)) return; // the user switched wallet meanwhile
   const link = `${location.origin}${location.pathname}?transfer=${escrowAddress(sender, id).toBase58()}`;
   const own = connectedWallets().includes(recipient.toBase58());
+  sharedRecipient = ''; // sent: the next send starts empty
   Object.assign(state, { form: emptyForm(asset), fee: null, check: null });
   accountExists.clear(); // the send may have created token accounts
   state.flash = { tab: 'send', target: 'send-result', kind: 'ok', html: `
@@ -751,6 +754,7 @@ function activate(wallet: string): void {
   Object.assign(state, { menu: false, pending: null, notice: null });
   render();
   void refresh();
+  if (state.form.recipient && !state.fee) void checkRecipient();
 }
 
 function clearWallet(): void {
